@@ -1,0 +1,6 @@
+capvenv
+.env
+__pycache__
+source_pg_data
+config
+logs/
