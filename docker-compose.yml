@@ -1,29 +1,25 @@
-version: '3.8'
+# version: '3.9'
+
 x-airflow-common:
   &airflow-common
-  # In order to add custom dependencies or upgrade provider packages you can use your extended image.
-  # Comment the image line, place your Dockerfile in the directory where you placed the docker-compose.yaml
-  # and uncomment the "build" line below, Then run `docker-compose build` to build the images.
   image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.1}
-  # build: .
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
     AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    # For backward compatibility, with Airflow <2.3
     AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
     AIRFLOW__CORE__FERNET_KEY: ''
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
-    AIRFLOW_CORE_TEST_CONNECTION: 'Enabled'
-    # yamllint disable rule:line-length
-    # Use simple http server on scheduler for health checks
-    # See https://airflow.apache.org/docs/apache-airflow/stable/administration-and-deployment/logging-monitoring/check-health.html#scheduler-health-check-server
-    # yamllint enable rule:line-length
+    AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
     AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    # WARNING: Use _PIP_ADDITIONAL_REQUIREMENTS option ONLY for a quick checks
-    # for other purpose (development, test and especially production usage) build/extend Airflow image.
+    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
+    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
+    AIRFLOW__LOGGING__REMOTE_LOGGING: 'False'
+    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: ''
+    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: 'airflow_db'
+    AIRFLOW__WEBSERVER__BASE_URL: 'http://localhost:8082'
     _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
   volumes:
     - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
@@ -35,6 +31,12 @@ x-airflow-common:
     &airflow-common-depends-on
     postgres:
       condition: service_healthy
+    source_db:
+      condition: service_healthy
+
+networks:
+  airflow_network:
+    driver: bridge        
 
 services:
   postgres:
@@ -43,6 +45,14 @@ services:
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: '4g' 
+        reservations:
+          cpus: '1.0'
+          memory: '2g'  
     volumes:
       - ./postgres-db-volume:/var/lib/postgresql/data
     healthcheck:
@@ -51,26 +61,45 @@ services:
       retries: 5
       start_period: 5s
     restart: always
+    networks:
+      - airflow_network
 
   source_db: 
-    image: postgres:13
+    image: postgres:latest
     environment:
       POSTGRES_USER: alt_cap_user
       POSTGRES_PASSWORD: secretCapstone
       POSTGRES_DB: ecommerce
+    deploy:
+      resources:
+        limits:
+          cpus: '4.0'
+          memory: '8g'
+        reservations:
+          cpus: '1.0'
+          memory: '2g'    
     ports:
       - "5433:5432"
     volumes:
       - ./source_pg_data:/var/lib/postgresql/data
       - ./data:/data
-      - ./infra_setup/init.sql:/docker-entrypoint-initdb.d/init.sql  
-
+      - ./infra_setup/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U alt_cap_user -d ecommerce"]
+      interval: 10s
+      retries: 5
+      start_period: 10s
+      timeout: 5s   
+    restart: always    
+    networks:
+      - airflow_network
 
   airflow-webserver:
     <<: *airflow-common
     command: webserver
+
     ports:
-      - "8081:8080"
+      - "8082:8080"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
@@ -82,6 +111,16 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0' 
+          memory: '4g'
+        reservations:
+          cpus: '1.0'
+          memory: '2g'    
+    networks:
+      - airflow_network    
 
   airflow-scheduler:
     <<: *airflow-common
@@ -97,10 +136,22 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'  
+          memory: '4g' 
+        reservations:
+          cpus: '1.0'
+          memory: '2g'  
+    networks:
+      - airflow_network    
 
   airflow-triggerer:
     <<: *airflow-common
     command: triggerer
+    environment:
+      - PYTHONASYNCIODEBUG=1
     healthcheck:
       test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
       interval: 30s
@@ -112,18 +163,21 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
+    networks:
+      - airflow_network    
 
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
-    # yamllint disable rule:line-length
     command:
       - -c
       - |
+        echo "Starting airflow-init..."
+        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        echo "Airflow version: $${airflow_version}"
         function ver() {
           printf "%04d%04d%04d%04d" $${1//./ }
         }
-        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
         airflow_version_comparable=$$(ver $${airflow_version})
         min_airflow_version=2.2.0
         min_airflow_version_comparable=$$(ver $${min_airflow_version})
@@ -179,7 +233,6 @@ services:
         mkdir -p /sources/logs /sources/dags /sources/plugins
         chown -R "${AIRFLOW_UID}:0" /sources/{logs,dags,plugins}
         exec /entrypoint airflow version
-    # yamllint enable rule:line-length
     environment:
       <<: *airflow-common-env
       _AIRFLOW_DB_MIGRATE: 'true'
@@ -190,16 +243,17 @@ services:
     user: "0:0"
     volumes:
       - ${AIRFLOW_PROJ_DIR:-.}:/sources
+    networks:
+      - airflow_network  
 
   airflow-cli:
     <<: *airflow-common
-    profiles:
-      - debug
     environment:
       <<: *airflow-common-env
       CONNECTION_CHECK_MAX_COUNT: "0"
-    # Workaround for entrypoint issue. See: https://github.com/apache/airflow/issues/16252
     command:
       - bash
       - -c
       - airflow
+    networks:
+      - airflow_network

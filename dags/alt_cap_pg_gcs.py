@@ -1,108 +1,174 @@
 from airflow import DAG
-from airflow.models import Connection
-from airflow.providers.postgres.hooks.postgres import PostgresHook
-from airflow.providers.google.cloud.transfers.postgres_to_gcs import PostgresToGCSOperator
-from airflow.providers.google.cloud.transfers.gcs_to_bigquery import GCSToBigQueryOperator
-from airflow.utils.dates import days_ago
-from datetime import timedelta
-from airflow.hooks.base import BaseHook
-from airflow.operators.python import PythonOperator
+from airflow.providers.google.cloud.transfers.postgres_to_gcs import (
+    PostgresToGCSOperator,
+)
+from airflow.providers.google.cloud.transfers.gcs_to_bigquery import (
+    GCSToBigQueryOperator,
+)
+from datetime import datetime, timedelta
+import logging
 
 
-# Connection IDs
-POSTGRES_CONN_ID = 'alt_capstone_pg_conn'
-GCP_CONN_ID = 'alt_cap_gcp_conn'
+# Bigquery config variables
+BQ_CONN_ID = "altcapgcpconn"
+GCS_PROJECT = "pygcs-425623"
+BQ_DATASET = "capstone_etl"
+BQ_TABLE = "capstone_table"
+GCS_BUCKET = "etl_basic"
 
-# DAG configuration
-DAG_ID = 'postgres_to_gcs_to_bigquery'
-SCHEDULE_INTERVAL = '@daily'
-START_DATE = days_ago(1)
-
-# GCS and BigQuery configuration
-GCS_BUCKET = 'etl_basic'
-PROJECT_ID = 'pygcs-425623'
-DATASET_ID = 'capstone_etl'
+# Postgres config variables
+PG_CONN_ID = "altcapstonepgconn"
+PG_SCHEMA = "alt_cap"
 
 
-default_args = {
-    'owner': 'alt_capstone',
-    'depends_on_past': False,
-    'email_on_failure': False,
-    'email_on_retry': False,
-    'retries': 1,
-    'retry_delay': timedelta(minutes=5),
+tables = [
+    "olist_customers",
+    "olist_geolocation",
+    "olist_order_items",
+    "olist_order_payments",
+    "olist_order_reviews",
+    "olist_orders",
+    "olist_products",
+    "olist_sellers",
+    "product_category_name_translation",
+]
+
+# Define schemas for each table
+table_schemas = {
+    "olist_customers": [
+        {"name": "customer_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "customer_unique_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "customer_zip_code_prefix", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "customer_city", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "customer_state", "type": "STRING", "mode": "NULLABLE"},
+    ],
+    "olist_geolocation": [
+        {"name": "geolocation_zip_code_prefix", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "geolocation_lat", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "geolocation_lng", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "geolocation_city", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "geolocation_state", "type": "STRING", "mode": "NULLABLE"},
+    ],
+    "olist_order_items": [
+        {"name": "order_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "order_item_id", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "product_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "seller_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "shipping_limit_date", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "price", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "freight_value", "type": "FLOAT", "mode": "NULLABLE"},
+    ],
+    "olist_order_payments": [
+        {"name": "order_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "payment_sequential", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "payment_type", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "payment_installments", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "payment_value", "type": "FLOAT", "mode": "NULLABLE"},
+    ],
+    "olist_order_reviews": [
+        {"name": "review_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "order_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "review_score", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "review_comment_title", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "review_comment_message", "type": "text", "mode": "NULLABLE"},
+        {"name": "review_creation_date", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "review_answer_timestamp", "type": "TIMESTAMP", "mode": "NULLABLE"},
+    ],
+    "olist_orders": [
+        {"name": "order_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "customer_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "order_status", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "order_purchase_timestamp", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {"name": "order_approved_at", "type": "TIMESTAMP", "mode": "NULLABLE"},
+        {
+            "name": "order_delivered_carrier_date",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE",
+        },
+        {
+            "name": "order_delivered_customer_date",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE",
+        },
+        {
+            "name": "order_estimated_delivery_date",
+            "type": "TIMESTAMP",
+            "mode": "NULLABLE",
+        },
+    ],
+    "olist_products": [
+        {"name": "product_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "product_category_name", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "product_name_lenght", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "product_description_lenght", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "product_photos_qty", "type": "INTEGER", "mode": "NULLABLE"},
+        {"name": "product_weight_g", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "product_length_cm", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "product_height_cm", "type": "FLOAT", "mode": "NULLABLE"},
+        {"name": "product_width_cm", "type": "FLOAT", "mode": "NULLABLE"},
+    ],
+    "olist_sellers": [
+        {"name": "seller_id", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "seller_zip_code_prefix", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "seller_city", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "seller_state", "type": "STRING", "mode": "NULLABLE"},
+    ],
+    "product_category_name_translation": [
+        {"name": "product_category_name", "type": "STRING", "mode": "NULLABLE"},
+        {"name": "product_category_name_english", "type": "STRING", "mode": "NULLABLE"},
+    ],
 }
 
-def test_connections():
-    # Test PostgreSQL connection
-    try:
-        postgres_hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-        postgres_conn = postgres_hook.get_conn()
-        cursor = postgres_conn.cursor()
-        cursor.execute("SELECT 1")
-        result = cursor.fetchone()
-        print(f"PostgreSQL Connection Test: {result}")
-    except Exception as e:
-        print(f"PostgreSQL Connection Error: {str(e)}")
+default_args = {
+    "owner": "alt_capstone",
+    "depends_on_past": False,
+    "start_date": datetime(2024, 7, 29),
+    "email_on_failure": False,
+    "email_on_retry": False,
+    "retries": 2,
+    "retry_delay": timedelta(minutes=5),
+}
 
-    # Test Google Cloud connection
-    try:
-        gcp_conn = BaseHook.get_connection(GCP_CONN_ID)
-        print(f"GCP Connection Test - Project ID: {gcp_conn.extra_dejson.get('project')}")
-    except Exception as e:
-        print(f"GCP Connection Error: {str(e)}")    
-
-
-def get_postgres_tables():
-    hook = PostgresHook(postgres_conn_id=POSTGRES_CONN_ID)
-    # Query to get all table names from a specific schema
-    sql = "SELECT table_name FROM information_schema.tables WHERE table_schema = 'alt_cap'"
-    return [row[0] for row in hook.get_records(sql)]
-
-
-with DAG(
-    DAG_ID,
+dag = DAG(
+    "extract_load_olist_dataset",
     default_args=default_args,
-    description='Transfer data from PostgreSQL to GCS to BigQuery',
-    schedule_interval=SCHEDULE_INTERVAL,
-    start_date=START_DATE,
+    description="Extract Olist data from PostgreSQL, load to GCS, and then to BigQuery",
+    schedule_interval=None,
     catchup=False,
-    tags=['postgres', 'gcs', 'bigquery'],
-) as dag:
-    
-    test_connections_task = PythonOperator(
-    task_id='test_connections',
-    python_callable=test_connections,
-    dag=dag
+)
+
+for table in tables:
+    schema = table_schemas.get(table)
+    logging.info(f"Starting extraction for table: {table}")
+    if schema is None:
+        logging.error(f"Schema for table: {table} is missing")
+        raise ValueError(f"Schema for table: {table} is missing")
+
+    postgres_to_gcs_task = PostgresToGCSOperator(
+        task_id=f"extract_load_{table}_to_gcs",
+        postgres_conn_id=PG_CONN_ID,
+        gcp_conn_id=BQ_CONN_ID,
+        sql=f'SELECT * FROM "{PG_SCHEMA}"."{table}";',
+        bucket=GCS_BUCKET,
+        filename=f"raw/{table}/{{{{ ds }}}}/{table}.csv",
+        export_format="PARQUET",
+        use_server_side_cursor=True,
+        retries=2,
+        retry_delay=timedelta(minutes=5),
+        dag=dag,
     )
 
-    tables = get_postgres_tables()
+    gcs_to_bigquery_task = GCSToBigQueryOperator(
+        task_id=f"gcs_to_bigquery_{table}",
+        bucket=GCS_BUCKET,
+        source_objects=[f"raw/{table}/{{{{ ds }}}}/{table}.parquet"],
+        destination_project_dataset_table=f"{GCS_PROJECT}.{BQ_DATASET}.{table}",
+        create_disposition="CREATE_IF_NEEDED",
+        write_disposition="WRITE_TRUNCATE",
+        source_format="PARQUET",
+        schema_fields=schema,
+        gcp_conn_id=BQ_CONN_ID,
+        dag=dag,
+    )
 
-    for table in tables:
-        postgres_to_gcs = PostgresToGCSOperator(
-            task_id=f'postgres_to_gcs_{table}',
-            postgres_conn_id=POSTGRES_CONN_ID,
-            google_cloud_storage_conn_id=GCP_CONN_ID,
-            sql=f'SELECT * FROM {table}',
-            bucket=GCS_BUCKET,
-            filename=f'data/{table}/{{{{ ds }}}}/{table}.csv',
-            export_format='csv',
-            use_server_side_cursor=True,
-        )
-
-    gcs_to_bigquery = GCSToBigQueryOperator(
-            task_id=f'gcs_to_bigquery_{table}',
-            bucket=GCS_BUCKET,
-            source_objects=[f'data/{table}/{{{{ ds }}}}/{table}.csv'],
-            destination_project_dataset_table=f'{PROJECT_ID}.{DATASET_ID}.{table}',
-            write_disposition='WRITE_TRUNCATE',
-            source_format='CSV',
-            autodetect=True,
-            bigquery_conn_id=GCP_CONN_ID,
-            google_cloud_storage_conn_id=GCP_CONN_ID,
-        )
-
-
-    
-    test_connections_task >> postgres_to_gcs >> gcs_to_bigquery
-    
+    postgres_to_gcs_task >> gcs_to_bigquery_task
