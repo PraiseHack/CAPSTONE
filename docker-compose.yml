@@ -1,105 +1,117 @@
-# version: '3.9'
+# version: '3'
 
-x-airflow-common:
-  &airflow-common
-  image: ${AIRFLOW_IMAGE_NAME:-apache/airflow:2.7.1}
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.7.1
+
   environment:
     &airflow-common-env
-    AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-    AIRFLOW__CORE__FERNET_KEY: ''
-    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'true'
-    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
-    AIRFLOW__CORE__TEST_CONNECTION: 'Enabled'
-    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: 'true'
-    AIRFLOW__LOGGING__BASE_LOG_FOLDER: /opt/airflow/logs
-    AIRFLOW__LOGGING__LOGGING_LEVEL: INFO
-    AIRFLOW__LOGGING__REMOTE_LOGGING: 'False'
-    AIRFLOW__LOGGING__REMOTE_BASE_LOG_FOLDER: ''
-    AIRFLOW__LOGGING__REMOTE_LOG_CONN_ID: 'airflow_db'
-    AIRFLOW__WEBSERVER__BASE_URL: 'http://localhost:8082'
-    _PIP_ADDITIONAL_REQUIREMENTS: ${_PIP_ADDITIONAL_REQUIREMENTS:-}
+    AIRFLOW_CORE_EXECUTOR: CeleryExecutor
+    AIRFLOW_DATABASESQL_ALCHEMY_CONN: ${AIRFLOWDATABASE_SQL_ALCHEMY_CONN} # postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW_CONN_SOURCE_POSTGRES: postgresql+psycopg2://${SOURCE_PG_USER}:${SOURCE_PG_PASS}@$source-postgres/${SOURCE_PG_DB}
+    AIRFLOW_CELERYRESULT_BACKEND: ${AIRFLOWCELERY_RESULT_BACKEND} # db+postgresql://airflow:airflow@postgres/airflow
+    AIRFLOW_CELERY_BROKER_URL: redis://:${REDIS_PASSWORD}@redis:6379/0 # redis://:redispass@redis:6379/0
+    AIRFLOW_CORE_FERNET_KEY: ${FERNET_KEY}
+    AIRFLOW_CORE_DAGS_ARE_PAUSED_AT_CREATION: 'true'
+    AIRFLOW_CORE_LOAD_EXAMPLES: 'false'
+    AIRFLOW_CORE_TEST_CONNECTION: Enabled
+    AIRFLOW_API_AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    AIRFLOW_SCHEDULER_ENABLE_HEALTH_CHECK: 'true'
+    _PIP_ADDITIONAL_REQUIREMENTS: |
+      apache-airflow[google]
+      apache-airflow-providers-google
+      apache-airflow-providers-postgres
+      psycopg2-binary 
+      apache-airflow-providers-common-sql
   volumes:
-    - ${AIRFLOW_PROJ_DIR:-.}/dags:/opt/airflow/dags
-    - ${AIRFLOW_PROJ_DIR:-.}/logs:/opt/airflow/logs
-    - ${AIRFLOW_PROJ_DIR:-.}/config:/opt/airflow/config
-    - ${AIRFLOW_PROJ_DIR:-.}/plugins:/opt/airflow/plugins
+    - ./airflow/dags:/opt/airflow/dags
+    - ./airflow/config:/opt/airflow/config
+    - ./airflow/logs:/opt/airflow/logs
+    - ./airflow/plugins:/opt/airflow/plugins
+
   user: "${AIRFLOW_UID:-50000}:0"
+
   depends_on:
     &airflow-common-depends-on
-    postgres:
+    redis:
       condition: service_healthy
-    source_db:
+    airflow-postgres:
       condition: service_healthy
-
-networks:
-  airflow_network:
-    driver: bridge        
 
 services:
-  postgres:
+  # airflow postgres db
+  airflow-postgres:
     image: postgres:13
     environment:
-      POSTGRES_USER: airflow
-      POSTGRES_PASSWORD: airflow
-      POSTGRES_DB: airflow
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'
-          memory: '4g' 
-        reservations:
-          cpus: '1.0'
-          memory: '2g'  
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
     volumes:
-      - ./postgres-db-volume:/var/lib/postgresql/data
+      - ./airflow/airflow_pg_data:/var/lib/postgresql/airflow/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "airflow"]
+      test: ["CMD", "pg_isready", "-U", "${POSTGRES_USER}"]
       interval: 10s
       retries: 5
       start_period: 5s
     restart: always
-    networks:
-      - airflow_network
+    # networks:
+    #   - source_data_network
 
-  source_db: 
-    image: postgres:latest
+  # source database for injestion
+  source-postgres:
+    image: postgres:13
     environment:
-      POSTGRES_USER: alt_cap_user
-      POSTGRES_PASSWORD: secretCapstone
-      POSTGRES_DB: ecommerce
-    deploy:
-      resources:
-        limits:
-          cpus: '4.0'
-          memory: '8g'
-        reservations:
-          cpus: '1.0'
-          memory: '2g'    
-    ports:
-      - "5433:5432"
+      POSTGRES_DB: ${SOURCE_PG_DB}
+      POSTGRES_USER: ${SOURCE_PG_USER}
+      POSTGRES_PASSWORD: ${SOURCE_PG_PASS}
     volumes:
-      - ./source_pg_data:/var/lib/postgresql/data
-      - ./data:/data
-      - ./infra_setup/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./pg/source_pg_data:/var/lib/postgresql/src_db/data
+      - ./pg/data:/data
+      - ./pg/init.sql:/docker-entrypoint-initdb.d/init.sql
+    ports:
+      - '5433:5432'
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U alt_cap_user -d ecommerce"]
+      test: ["CMD-SHELL", "pg_isready -U ${SOURCE_PG_USER} -d ${SOURCE_PG_DB}"]
+      # test: ["CMD-SHELL", "pg_isready -h localhost -p 5432 -U alt_cap_user -d ecommerce"]
       interval: 10s
+      timeout: 5s
       retries: 5
-      start_period: 10s
-      timeout: 5s   
-    restart: always    
-    networks:
-      - airflow_network
+    # networks:
+    #   - source_data_network
 
+  # source database visualixation
+  # metabase:
+  #   image: metabase/metabase:latest
+  #   depends_on:
+  #     - source-postgres
+  #   ports:
+  #     - 3000:3000
+  #   networks:
+  #     - source_data_network
+  
+  # redis
+  redis:
+    image: redis:latest
+    command: redis-server --requirepass ${REDIS_PASSWORD}
+    expose:
+      - 6379
+    healthcheck:
+      test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+      interval: 10s
+      timeout: 30s
+      retries: 50
+      start_period: 30s
+    restart: always
+    environment:
+      - REDIS_PASSWORD=${REDIS_PASSWORD}
+    # networks:
+    #   - source_data_network
+  
+  # web server
   airflow-webserver:
     <<: *airflow-common
     command: webserver
-
     ports:
-      - "8082:8080"
+      - "8084:8080"
     healthcheck:
       test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
       interval: 30s
@@ -111,17 +123,8 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0' 
-          memory: '4g'
-        reservations:
-          cpus: '1.0'
-          memory: '2g'    
-    networks:
-      - airflow_network    
-
+  
+  # airflow scheduler
   airflow-scheduler:
     <<: *airflow-common
     command: scheduler
@@ -136,22 +139,32 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
-    deploy:
-      resources:
-        limits:
-          cpus: '2.0'  
-          memory: '4g' 
-        reservations:
-          cpus: '1.0'
-          memory: '2g'  
-    networks:
-      - airflow_network    
+  
+  # airflow workers
+  airflow-worker:
+    <<: *airflow-common
+    command: celery worker
+    healthcheck:
+      test:
+        - "CMD-SHELL"
+        - 'celery --app airflow.executors.celery_executor.app inspect ping -d "celery@$${HOSTNAME}"'
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    environment:
+      <<: *airflow-common-env
+      DUMB_INIT_SETSID: "0"
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
 
+  # 
   airflow-triggerer:
     <<: *airflow-common
     command: triggerer
-    environment:
-      - PYTHONASYNCIODEBUG=1
     healthcheck:
       test: ["CMD-SHELL", 'airflow jobs check --job-type TriggererJob --hostname "$${HOSTNAME}"']
       interval: 30s
@@ -163,31 +176,28 @@ services:
       <<: *airflow-common-depends-on
       airflow-init:
         condition: service_completed_successfully
-    networks:
-      - airflow_network    
-
+  
+  # initialization
   airflow-init:
     <<: *airflow-common
     entrypoint: /bin/bash
     command:
       - -c
       - |
-        echo "Starting airflow-init..."
-        airflow_version=$$(AIRFLOW__LOGGING__LOGGING_LEVEL=INFO && gosu airflow airflow version)
-        echo "Airflow version: $${airflow_version}"
-        function ver() {
-          printf "%04d%04d%04d%04d" $${1//./ }
-        }
-        airflow_version_comparable=$$(ver $${airflow_version})
-        min_airflow_version=2.2.0
-        min_airflow_version_comparable=$$(ver $${min_airflow_version})
-        if (( airflow_version_comparable < min_airflow_version_comparable )); then
-          echo
-          echo -e "\033[1;31mERROR!!!: Too old Airflow version $${airflow_version}!\e[0m"
-          echo "The minimum Airflow version supported: $${min_airflow_version}. Only use this or higher!"
-          echo
-          exit 1
-        fi
+        # function ver() {
+        #   printf "%04d%04d%04d%04d" $${1//./ }
+        # }
+        # airflow_version=$$(AIRFLOW_LOGGING_LOGGING_LEVEL=INFO && gosu airflow airflow version)
+        # airflow_version_comparable=$$(ver $${airflow_version})
+        # min_airflow_version=2.2.0
+        # min_airflow_version_comparable=$$(ver $${min_airflow_version})
+        # if (( airflow_version_comparable < min_airflow_version_comparable )); then
+        #   echo
+        #   echo -e "\033[1;31mERROR!!!: Too old Airflow version $${airflow_version}!\e[0m"
+        #   echo "The minimum Airflow version supported: $${min_airflow_version}. Only use this or higher!"
+        #   echo
+        #   exit 1
+        # fi
         if [[ -z "${AIRFLOW_UID}" ]]; then
           echo
           echo -e "\033[1;33mWARNING!!!: AIRFLOW_UID not set!\e[0m"
@@ -235,25 +245,48 @@ services:
         exec /entrypoint airflow version
     environment:
       <<: *airflow-common-env
-      _AIRFLOW_DB_MIGRATE: 'true'
+      _AIRFLOW_DB_UPGRADE: 'true'
       _AIRFLOW_WWW_USER_CREATE: 'true'
       _AIRFLOW_WWW_USER_USERNAME: ${_AIRFLOW_WWW_USER_USERNAME:-airflow}
       _AIRFLOW_WWW_USER_PASSWORD: ${_AIRFLOW_WWW_USER_PASSWORD:-airflow}
-      _PIP_ADDITIONAL_REQUIREMENTS: ''
-    user: "0:0"
+      # _PIP_ADDITIONAL_REQUIREMENTS: ''
+    user: "${AIRFLOW_UID:-50000}:0"
     volumes:
-      - ${AIRFLOW_PROJ_DIR:-.}:/sources
-    networks:
-      - airflow_network  
+      - ./airflow:/sources
+    # healthcheck:
+    #   test: ["CMD", "airflow", "db", "check"]
+    #   interval: 10s
+    #   timeout: 10s
+    #   retries: 5
+    #   start_period: 30s
+    # depends_on:
+    #   airflow-postgres:
+    #     condition: service_healthy
+    #   redis:
+    #     condition: service_healthy
 
-  airflow-cli:
+  # airflow celerry UI
+  flower:
     <<: *airflow-common
-    environment:
-      <<: *airflow-common-env
-      CONNECTION_CHECK_MAX_COUNT: "0"
-    command:
-      - bash
-      - -c
-      - airflow
-    networks:
-      - airflow_network
+    command: celery flower
+    ports:
+      - "5555:5555"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:5555/"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init:
+        condition: service_completed_successfully
+
+# networks:
+#   source_data_network:
+#     driver: bridge
+
+volumes:
+  source_pg_data:
+  airflow_pg_data:
