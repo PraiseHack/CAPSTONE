@@ -4,4 +4,3 @@ __pycache__
 source_pg_data
 config
 logs/
-postgres-db-volume
